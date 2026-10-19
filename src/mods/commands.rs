@@ -38,6 +38,7 @@ pub fn commands_dir() -> PathBuf {
     let home = std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".gray")))
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("commands")
 }
@@ -53,7 +54,9 @@ fn valid_name(name: &str) -> bool {
 /// Sorted (name, first line) for every `*.md` in `dir`.
 fn list_commands(dir: &Path) -> Vec<(String, String)> {
     let mut out = vec![];
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().is_none_or(|x| x != "md") {
@@ -141,9 +144,7 @@ fn pick_command(dir: &Path, ask: &mut dyn FnMut(&[Value]) -> Option<Value>) -> V
     }
     let options: Vec<Value> = cmds
         .iter()
-        .map(|(n, first)| {
-            json!({ "label": format!("/{n}"), "description": first })
-        })
+        .map(|(n, first)| json!({ "label": format!("/{n}"), "description": first }))
         .chain(std::iter::once(
             json!({"label": LABEL_CANCEL, "description": "don't run a command"}),
         ))
@@ -262,7 +263,9 @@ fn main_commands() -> std::io::Result<()> {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if let Some(id) = v.get("id").and_then(Value::as_str)
                 && v.get("method").is_none()
                 && let Some(tx) = reader_pending.lock().expect("pending").remove(id)
@@ -376,7 +379,10 @@ mod tests {
         let mut cancel = |_: &[Value]| -> Option<Value> {
             Some(json!({"answers": {PICK_QID: {"answers": ["cancel"]}}}))
         };
-        assert_eq!(call_with(&dir, json!([]), &mut cancel)["result"]["text"], "cancelled");
+        assert_eq!(
+            call_with(&dir, json!([]), &mut cancel)["result"]["text"],
+            "cancelled"
+        );
         // No ask channel → falls back to the text list.
         let r = call(&dir, json!([]));
         assert!(r["result"]["text"].as_str().unwrap().contains("a — Do A"));
@@ -385,11 +391,14 @@ mod tests {
     #[test]
     fn bare_cmd_empty_dir_skips_picker() {
         let dir = tmpdir("pick-empty");
-        let mut ask = |_: &[Value]| -> Option<Value> {
-            panic!("no commands → no host/ask")
-        };
+        let mut ask = |_: &[Value]| -> Option<Value> { panic!("no commands → no host/ask") };
         let r = call_with(&dir, json!([]), &mut ask);
-        assert!(r["result"]["text"].as_str().unwrap().contains("no commands yet"));
+        assert!(
+            r["result"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no commands yet")
+        );
     }
 
     #[test]
@@ -415,6 +424,11 @@ mod tests {
     fn bad_name_rejected() {
         let dir = tmpdir("badname");
         let r = call(&dir, json!(["../etc/passwd"]));
-        assert!(r["result"]["text"].as_str().unwrap().contains("bad command name"));
+        assert!(
+            r["result"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("bad command name")
+        );
     }
 }

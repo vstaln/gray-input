@@ -158,13 +158,19 @@ fn input_submit(host: &Host, req: &Value) -> Value {
     if !params.is_object() {
         params = json!({});
     }
-    let original = params.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+    let original = params
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let mut text = original.clone();
     for module in SUBMIT_CHAIN {
         params["text"] = Value::String(text.clone());
         let stage_req = json!({ "id": req.get("id").cloned().unwrap_or(json!(0)),
                                 "method": "input/submit", "params": params });
-        let Some(result) = stage_result(host, module, &stage_req) else { continue };
+        let Some(result) = stage_result(host, module, &stage_req) else {
+            continue;
+        };
         if result.get("handled").and_then(Value::as_bool) == Some(true) {
             return json!({ "handled": true });
         }
@@ -172,7 +178,11 @@ fn input_submit(host: &Host, req: &Value) -> Value {
             text = t.to_string();
         }
     }
-    if text == original { json!({}) } else { json!({ "text": text }) }
+    if text == original {
+        json!({})
+    } else {
+        json!({ "text": text })
+    }
 }
 
 fn command_owner(name: &str) -> Option<&'static str> {
@@ -244,7 +254,9 @@ fn main() -> std::io::Result<()> {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if v.get("method").is_none() {
                 if let Some(id) = v.get("id").and_then(Value::as_str)
                     && let Some(tx) = reader_pending.lock().expect("pending").remove(id)

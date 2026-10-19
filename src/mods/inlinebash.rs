@@ -2,7 +2,8 @@
 //! gray-inline-bash — run shell commands inline, no model turn needed.
 //!
 //! Claims `input/submit` (protocol 2.0): a submitted `!<cmd>` or a line starting with `$ ` runs in
-//! the session cwd via `timeout 10 sh -c`, the output (capped at 4 KB) is
+//! the session cwd via the platform shell (`sh -c`, `cmd /C` on Windows)
+//! with a 10s cap — the output (capped at 4 KB) is
 //! shown via `host/say`, and the input is swallowed (`{handled: true}`).
 //!
 //! If `host/say` fails (capability ungranted, host gone) the input is
@@ -40,6 +41,7 @@ fn state_dir() -> PathBuf {
     let home = std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".gray")))
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("inline-bash")
 }
@@ -82,50 +84,89 @@ fn cap(s: &str, max: usize) -> String {
     format!("{}… [truncated]", &s[..end])
 }
 
-/// Run `timeout 10 sh -c <cmd>` in `cwd` (falls back to plain `sh -c` when
-/// `timeout` is missing). Returns combined stdout+stderr and the exit note.
+/// Platform shell: `sh -c` on unix, `cmd /C` on windows.
+#[cfg(windows)]
+fn shell_command(cmd: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("cmd");
+    c.args(["/C", cmd]);
+    c
+}
+
+/// Platform shell: `sh -c` on unix, `cmd /C` on windows.
+#[cfg(not(windows))]
+fn shell_command(cmd: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("sh");
+    c.args(["-c", cmd]);
+    c
+}
+
+/// Run `<cmd>` under the platform shell in `cwd` with a 10s in-process
+/// cap — no `timeout` binary needed, so this works on Windows too. The
+/// pipes drain on threads so a chatty child can't deadlock the timeout
+/// poll (same shape as gray-goal's auditor). Returns combined
+/// stdout+stderr and the exit note.
 fn run_command(cmd: &str, cwd: Option<&str>) -> String {
-    let spawn = |with_timeout: bool| {
-        let mut c = if with_timeout {
-            let mut c = std::process::Command::new("timeout");
-            c.args(["10", "sh", "-c", cmd]);
-            c
-        } else {
-            let mut c = std::process::Command::new("sh");
-            c.args(["-c", cmd]);
-            c
-        };
-        if let Some(d) = cwd.filter(|d| Path::new(d).is_dir()) {
-            c.current_dir(d);
-        }
-        c.output()
-    };
-    let out = spawn(true).or_else(|_| spawn(false));
-    match out {
-        Ok(o) => {
-            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-            let err = String::from_utf8_lossy(&o.stderr);
-            if !err.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(err.trim_end());
-            }
-            let text = text.trim_end();
-            let mut shown = if text.is_empty() {
-                String::from("(no output)")
-            } else {
-                cap(text, OUT_CAP)
-            };
-            if let Some(code) = o.status.code().filter(|c| *c != 0) {
-                shown.push_str(&format!("\n(exit {code})"));
-            } else if o.status.code().is_none() {
-                shown.push_str("\n(killed by signal)");
-            }
-            shown
-        }
-        Err(e) => format!("couldn't run `{cmd}`: {e}"),
+    use std::io::Read;
+    let mut c = shell_command(cmd);
+    if let Some(d) = cwd.filter(|d| Path::new(d).is_dir()) {
+        c.current_dir(d);
     }
+    let mut child = match c
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(ch) => ch,
+        Err(e) => return format!("couldn't run `{cmd}`: {e}"),
+    };
+    let mut out_pipe = child.stdout.take().expect("piped");
+    let mut err_pipe = child.stderr.take().expect("piped");
+    let out_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out_pipe.read_to_end(&mut b);
+        b
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err_pipe.read_to_end(&mut b);
+        b
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break (Some(s), false),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break (None, true);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => return format!("couldn't run `{cmd}`: {e}"),
+        }
+    };
+    let mut text = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
+    let err = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
+    if !err.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(err.trim_end());
+    }
+    let text = text.trim_end();
+    let mut shown = if text.is_empty() {
+        String::from("(no output)")
+    } else {
+        cap(text, OUT_CAP)
+    };
+    if timed_out {
+        shown.push_str("\n(timed out after 10s)");
+    } else if let Some(code) = status.and_then(|s| s.code()).filter(|c| *c != 0) {
+        shown.push_str(&format!("\n(exit {code})"));
+    } else if status.is_some_and(|s| s.code().is_none()) {
+        shown.push_str("\n(killed by signal)");
+    }
+    shown
 }
 
 fn on_submit(params: &Value, say: &mut dyn FnMut(&str) -> Result<(), String>) -> Value {
@@ -163,11 +204,18 @@ fn run_slash(argv: &[&str]) -> String {
                 std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&flag, b""))
             } else {
                 std::fs::remove_file(&flag).or_else(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
                 })
             };
             match res {
-                Ok(()) => format!("inline bash {}", if argv[0] == "off" { "off" } else { "on" }),
+                Ok(()) => format!(
+                    "inline bash {}",
+                    if argv[0] == "off" { "off" } else { "on" }
+                ),
                 Err(e) => format!("couldn't flip state: {e}"),
             }
         }
@@ -269,7 +317,9 @@ fn main_inlinebash() -> std::io::Result<()> {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if v.get("method").is_none() {
                 if let Some(id) = v.get("id").and_then(Value::as_str)
                     && let Some(tx) = reader_pending.lock().expect("pending").remove(id)
@@ -286,8 +336,14 @@ fn main_inlinebash() -> std::io::Result<()> {
 
     for req in work_rx {
         let mut say = |t: &str| {
-            host_call(&stdout, &pending, &counter, "host/say", json!({ "text": t }))
-                .map(|_| ())
+            host_call(
+                &stdout,
+                &pending,
+                &counter,
+                "host/say",
+                json!({ "text": t }),
+            )
+            .map(|_| ())
         };
         let (reply, exit) = handle_inlinebash(&req, &mut say);
         if let Some(reply) = reply {
@@ -321,9 +377,12 @@ mod tests {
 
     fn call(method: &str, params: Value, said: &mut Vec<String>) -> Value {
         let mut f = ok_say(said);
-        handle_inlinebash(&json!({ "id": 1, "method": method, "params": params }), &mut f)
-            .0
-            .unwrap()
+        handle_inlinebash(
+            &json!({ "id": 1, "method": method, "params": params }),
+            &mut f,
+        )
+        .0
+        .unwrap()
     }
 
     #[test]
@@ -340,7 +399,10 @@ mod tests {
     fn extract_bang_dollar_and_brace() {
         assert_eq!(extract_command("!ls -la").as_deref(), Some("ls -la"));
         assert_eq!(extract_command("!{pwd}").as_deref(), Some("pwd"));
-        assert_eq!(extract_command("$ git status").as_deref(), Some("git status"));
+        assert_eq!(
+            extract_command("$ git status").as_deref(),
+            Some("git status")
+        );
         assert_eq!(extract_command("  !echo hi  ").as_deref(), Some("echo hi"));
         assert_eq!(extract_command("hello !world"), None);
         assert_eq!(extract_command("what's $HOME"), None);
@@ -362,6 +424,7 @@ mod tests {
         assert!(s[0].starts_with("$ echo hi-from-test"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn dollar_runs_in_session_cwd() {
         let mut s = vec![];
@@ -401,9 +464,14 @@ mod tests {
     #[test]
     fn exit_code_is_shown() {
         let mut s = vec![];
+        let cmd = if cfg!(windows) {
+            "!exit /b 3"
+        } else {
+            "!exit 3"
+        };
         let r = call(
             "input/submit",
-            json!({"text": "!exit 3", "session": {"cwd": "/tmp"}}),
+            json!({"text": cmd, "session": {"cwd": "/tmp"}}),
             &mut s,
         );
         assert_eq!(r["result"]["handled"], true);

@@ -54,6 +54,7 @@ fn presets_dir() -> PathBuf {
     let home = std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".gray")))
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("presets")
 }
@@ -65,7 +66,9 @@ fn normalize(name: &str) -> Option<String> {
     if stem.is_empty()
         || stem.starts_with('.')
         || stem.contains(['/', '\\'])
-        || !stem.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || !stem
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
         return None;
     }
@@ -103,7 +106,11 @@ fn list_result() -> Value {
             presets_dir().join("<name>.md").display()
         )})
     } else {
-        let mut out = format!("{} preset(s) in {}:\n", names.len(), presets_dir().display());
+        let mut out = format!(
+            "{} preset(s) in {}:\n",
+            names.len(),
+            presets_dir().display()
+        );
         for n in &names {
             out.push_str(&format!("  {n}\n"));
         }
@@ -141,7 +148,12 @@ fn use_preset(name: &str) -> Value {
 fn preset_preview(name: &str) -> String {
     std::fs::read_to_string(presets_dir().join(format!("{name}.md")))
         .ok()
-        .and_then(|c| c.lines().map(str::trim).find(|l| !l.is_empty()).map(String::from))
+        .and_then(|c| {
+            c.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(String::from)
+        })
         .map(|l| l.chars().take(60).collect())
         .unwrap_or_else(|| "empty preset".into())
 }
@@ -172,7 +184,7 @@ fn run_command(argv: &[&str], ask: &mut Ask) -> Value {
             }));
             let label = picked_label(picked.as_ref(), Q_PRESET).unwrap_or_default();
             // A real preset named "none" still wins over the sentinel label.
-            if names.iter().any(|n| *n == label) {
+            if names.contains(&label) {
                 use_preset(&label)
             } else {
                 list_result()
@@ -193,7 +205,11 @@ fn run_command(argv: &[&str], ask: &mut Ask) -> Value {
             let path = dir.join(format!("{name}.md"));
             let existed = path.exists();
             if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| {
-                if existed { Ok(()) } else { std::fs::write(&path, b"") }
+                if existed {
+                    Ok(())
+                } else {
+                    std::fs::write(&path, b"")
+                }
             }) {
                 return json!({"text": format!("couldn't create preset: {e}")});
             }
@@ -253,7 +269,9 @@ fn main_preset() -> std::io::Result<()> {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if let Some(id) = v.get("id").and_then(Value::as_str)
                 && v.get("method").is_none()
             {
@@ -349,7 +367,10 @@ mod tests {
     }
 
     fn preset(argv: &[&str]) -> Value {
-        call("command/run", json!({"name": "/preset", "argv": argv, "session": {"id": "s", "cwd": "/tmp"}}))
+        call(
+            "command/run",
+            json!({"name": "/preset", "argv": argv, "session": {"id": "s", "cwd": "/tmp"}}),
+        )
     }
 
     #[test]
@@ -378,8 +399,16 @@ mod tests {
             // new on an existing file doesn't clobber.
             std::fs::write(&file, "Read-only mode. Do not edit files.").unwrap();
             let r = preset(&["new", "plan"]);
-            assert!(r["result"]["text"].as_str().unwrap().contains("already exists"));
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), "Read-only mode. Do not edit files.");
+            assert!(
+                r["result"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("already exists")
+            );
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "Read-only mode. Do not edit files."
+            );
 
             // list shows it.
             let r = preset(&["list"]);
@@ -394,7 +423,12 @@ mod tests {
 
             // Unknown preset says what's available.
             let r = preset(&["use", "nope"]);
-            assert!(r["result"]["text"].as_str().unwrap().contains("Unknown preset \"nope\""));
+            assert!(
+                r["result"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Unknown preset \"nope\"")
+            );
             assert!(r["result"]["text"].as_str().unwrap().contains("plan"));
         });
     }
@@ -440,7 +474,10 @@ mod tests {
                 &mut ask,
             );
             // "fast" is empty → the text answer path; "plan" proves {prompt}.
-            assert!(r["result"]["text"].as_str().unwrap().contains("empty"), "{r}");
+            assert!(
+                r["result"]["text"].as_str().unwrap().contains("empty"),
+                "{r}"
+            );
             let mut ask = picking(1); // "plan"
             let r = call_ask(
                 "command/run",
@@ -465,7 +502,10 @@ mod tests {
                 &mut ask,
             );
             let text = r["result"]["text"].as_str().unwrap();
-            assert!(text.contains("1 preset(s)") && text.contains("plan"), "{text}");
+            assert!(
+                text.contains("1 preset(s)") && text.contains("plan"),
+                "{text}"
+            );
         });
     }
 
@@ -475,13 +515,19 @@ mod tests {
             preset(&["new", "plan"]);
             let r = preset(&[]); // ask returns None
             let text = r["result"]["text"].as_str().unwrap();
-            assert!(text.contains("1 preset(s)") && text.contains("plan"), "{text}");
+            assert!(
+                text.contains("1 preset(s)") && text.contains("plan"),
+                "{text}"
+            );
         });
     }
 
     #[test]
     fn shutdown_replies_then_exits() {
-        let (reply, exit) = handle_preset(&json!({ "id": 2, "method": "plugin/shutdown" }), &mut |_p: &Value| None);
+        let (reply, exit) = handle_preset(
+            &json!({ "id": 2, "method": "plugin/shutdown" }),
+            &mut |_p: &Value| None,
+        );
         assert!(reply.is_some() && exit);
     }
 }
