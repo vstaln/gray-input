@@ -28,6 +28,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+mod parts;
+
 #[allow(dead_code)]
 #[path = "mods/commands.rs"]
 mod commands;
@@ -46,15 +48,63 @@ const SAY_TTL: Duration = Duration::from_secs(10);
 /// host/ask wait (commands + preset used 300s, under the host's 330s TTL).
 const ASK_TTL: Duration = Duration::from_secs(300);
 
-fn manifest() -> Value {
+const PARTS: &[parts::Part] = &[
+    parts::Part {
+        name: "commands",
+        default: true,
+        description: "prompt templates from ~/.gray/commands",
+    },
+    parts::Part {
+        name: "preset",
+        default: true,
+        description: "working-preference bundles from ~/.gray/presets",
+    },
+    parts::Part {
+        name: "transform",
+        default: true,
+        description: "quick-word rewrites and rules from ~/.gray/transform",
+    },
+    parts::Part {
+        name: "inline-bash",
+        default: true,
+        description: "run `!cmd` inline from the input box",
+    },
+];
+
+fn manifest(parts: &parts::Parts) -> Value {
+    let mut commands: Vec<&str> = vec!["/input"];
+    if parts.on("commands") {
+        commands.push("/cmd");
+    }
+    if parts.on("preset") {
+        commands.push("/preset");
+    }
+    if parts.on("transform") {
+        commands.push("/transform");
+    }
+    if parts.on("inline-bash") {
+        commands.push("/inline");
+    }
+    let mut hooks: Vec<&str> = Vec::new();
+    if parts.on("transform") || parts.on("inline-bash") {
+        hooks.push("input/submit");
+    }
+    let mut capabilities: Vec<&str> = Vec::new();
+    if parts.on("commands") || parts.on("preset") {
+        capabilities.push("host.ask");
+    }
+    if parts.on("transform") || parts.on("inline-bash") {
+        capabilities.push("host.say");
+    }
     json!({
         "name": "input",
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "2.0",
         "tools": [],
-        "commands": ["/input", "/cmd", "/preset", "/transform", "/inline"],
-        "hooks": ["input/submit"],
-        "capabilities": ["host.say", "host.ask"],
+        "commands": commands,
+        "hooks": hooks,
+        "capabilities": capabilities,
+        "parts": parts.manifest(PARTS),
     })
 }
 
@@ -153,7 +203,21 @@ fn dispatch(host: &Host, module: &str, req: &Value) -> (Option<Value>, bool) {
 /// Fixed `input/submit` chain order.
 const SUBMIT_CHAIN: [&str; 4] = ["commands", "preset", "transform", "inlinebash"];
 
-fn input_submit(host: &Host, req: &Value) -> Value {
+const MODULE_PARTS: [(&str, &str); 4] = [
+    ("commands", "commands"),
+    ("preset", "preset"),
+    ("transform", "transform"),
+    ("inlinebash", "inline-bash"),
+];
+
+fn module_part(module: &str) -> &str {
+    MODULE_PARTS
+        .iter()
+        .find(|(m, _)| *m == module)
+        .map_or("", |(_, part)| *part)
+}
+
+fn input_submit(host: &Host, req: &Value, parts: &parts::Parts) -> Value {
     let mut params = req.get("params").cloned().unwrap_or_else(|| json!({}));
     if !params.is_object() {
         params = json!({});
@@ -165,6 +229,9 @@ fn input_submit(host: &Host, req: &Value) -> Value {
         .to_string();
     let mut text = original.clone();
     for module in SUBMIT_CHAIN {
+        if !parts.on(module_part(module)) {
+            continue;
+        }
         params["text"] = Value::String(text.clone());
         let stage_req = json!({ "id": req.get("id").cloned().unwrap_or(json!(0)),
                                 "method": "input/submit", "params": params });
@@ -185,14 +252,15 @@ fn input_submit(host: &Host, req: &Value) -> Value {
     }
 }
 
-fn command_owner(name: &str) -> Option<&'static str> {
-    match name {
-        "/cmd" => Some("commands"),
-        "/preset" => Some("preset"),
-        "/transform" => Some("transform"),
-        "/inline" => Some("inlinebash"),
-        _ => None,
-    }
+fn command_owner(name: &str, parts: &parts::Parts) -> Option<&'static str> {
+    let module = match name {
+        "/cmd" => "commands",
+        "/preset" => "preset",
+        "/transform" => "transform",
+        "/inline" => "inlinebash",
+        _ => return None,
+    };
+    parts.on(module_part(module)).then_some(module)
 }
 
 /// `/input` — merged-plugin overview.
@@ -208,7 +276,7 @@ fn input_command() -> String {
     )
 }
 
-fn handle(host: &Host, req: &Value) -> (Option<Value>, bool) {
+fn handle(host: &Host, req: &Value, parts: &parts::Parts) -> (Option<Value>, bool) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -216,13 +284,18 @@ fn handle(host: &Host, req: &Value) -> (Option<Value>, bool) {
         return (None, method == "plugin/shutdown");
     };
     let result = match method {
-        "plugin/manifest" => manifest(),
-        "input/submit" => input_submit(host, req),
+        "plugin/manifest" => manifest(parts),
+        "input/submit" => {
+            if !parts.on("transform") && !parts.on("inline-bash") {
+                return (Some(json!({ "id": id, "result": {} })), false);
+            }
+            input_submit(host, req, parts)
+        }
         "command/run" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             if name == "/input" {
                 json!({ "text": input_command() })
-            } else if let Some(module) = command_owner(name) {
+            } else if let Some(module) = command_owner(name, parts) {
                 stage_result(host, module, req).unwrap_or_else(|| json!({}))
             } else {
                 json!({ "text": format!("unknown command {name} — try /input") })
@@ -238,8 +311,9 @@ fn handle(host: &Host, req: &Value) -> (Option<Value>, bool) {
 }
 
 fn main() -> std::io::Result<()> {
+    let parts = parts::Parts::load("input", PARTS);
     if std::env::args().nth(1).as_deref() == Some("manifest") {
-        println!("{}", manifest());
+        println!("{}", manifest(&parts));
         return Ok(());
     }
     let host = Host {
@@ -272,7 +346,7 @@ fn main() -> std::io::Result<()> {
     });
 
     for req in work_rx {
-        let (reply, exit) = handle(&host, &req);
+        let (reply, exit) = handle(&host, &req, &parts);
         if let Some(reply) = reply {
             let mut o = host.out.lock().expect("stdout");
             let _ = writeln!(o, "{reply}");
